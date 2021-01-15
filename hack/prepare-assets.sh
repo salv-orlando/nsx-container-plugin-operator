@@ -21,12 +21,10 @@ if [ -z "$1" ]; then
 fi
 
 THIS_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
+pushd $THIS_DIR/.. > /dev/null
 
 source ./get-kustomize.sh
-
 kustomize=$(check_or_install_kustomize)
-
-pushd $THIS_DIR/.. > /dev/null
 
 mkdir -p "$1"
 OUTPUT_DIR=$(cd "$1" && pwd)

@@ -10,7 +10,7 @@ GOPATH             ?= $$($(GO) env GOPATH)
 all: build
 
 LDFLAGS += $(VERSION_LDFLAGS)
-OPERATOR_NAME = nsx-ncp-operator
+OPERATOR_NAME = vmware/nsx-container-plugin-operator
 
 .PHONY: build
 build:

@@ -25,4 +25,13 @@ jobs:
         asset_path: ./assets/openshift4.tar.gz
         asset_name: openshift4.tar.gz
         asset_content_type: application/octet-stream
+    - name: Upload kubernetes tarball
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ github.event.release.upload_url }}
+        asset_path: ./assets/kubernetes.tar.gz
+        asset_name: kubernetes.tar.gz
+        asset_content_type: application/octet-stream
 

@@ -18,4 +18,4 @@ jobs:
       run: |
         VERSION="${TAG:10}" make
         echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin
-        docker push vmware/nsx-container-plung-operator:"${TAG:10}"
+        docker push vmware/nsx-container-plugin-operator:"${TAG:10}"

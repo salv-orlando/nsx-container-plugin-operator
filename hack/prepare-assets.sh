@@ -23,7 +23,7 @@ fi
 THIS_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
 pushd $THIS_DIR/.. > /dev/null
 
-source ./get-kustomize.sh
+source ./hack/get-kustomize.sh
 kustomize=$(check_or_install_kustomize)
 
 mkdir -p "$1"

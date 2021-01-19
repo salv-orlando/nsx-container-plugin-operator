@@ -21,7 +21,7 @@ jobs:
       - name: Build image
         run: make
       - name: Push images to registry
-        if: ${{ github.repository == 'vmware/nsx-container-plugin-operator' && github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+        if: ${{ github.repository == 'salv-orlando/nsx-container-plugin-operator' && github.event_name == 'push' && github.ref == 'refs/heads/master' }}
         env:
           DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}

@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"strings"
-	"time"
 
 	configv1 "github.com/openshift/api/config/v1"
 	"github.com/openshift/cluster-network-operator/pkg/apply"
@@ -19,7 +18,6 @@ import (
 	operatortypes "github.com/vmware/nsx-container-plugin-operator/pkg/types"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
@@ -42,11 +40,6 @@ var log = logf.Log.WithName("controller_pod")
 var SetControllerReference = controllerutil.SetControllerReference
 
 var ApplyObject = apply.ApplyObject
-
-// The periodic resync interval.
-// We will re-run the reconciliation logic, even if the NCP configuration
-// hasn't changed.
-var ResyncPeriod = 2 * time.Minute
 
 var firstBoot = true
 
@@ -157,7 +150,7 @@ type Adaptor interface {
 	setControllerReference(r *ReconcilePod, obj *unstructured.Unstructured) error
 }
 
-type Pod struct {}
+type Pod struct{}
 
 type PodK8s struct {
 	Pod
@@ -177,9 +170,9 @@ func (r *ReconcilePod) isForNcpDeployOrNodeAgentDS(request reconcile.Request) bo
 }
 
 func (r *ReconcilePod) isForNsxNodeAgentPod(request reconcile.Request) bool {
-	if (request.Namespace == operatortypes.NsxNamespace && strings.Contains(
+	if request.Namespace == operatortypes.NsxNamespace && strings.Contains(
 		request.Name, operatortypes.NsxNodeAgentDsName) &&
-		request.Name != operatortypes.NsxNodeAgentDsName) {
+		request.Name != operatortypes.NsxNodeAgentDsName {
 		return true
 	}
 	return false
@@ -190,15 +183,17 @@ func (r *ReconcilePod) isForNsxNodeAgentPod(request reconcile.Request) bool {
 func (r *ReconcilePod) Reconcile(request reconcile.Request) (reconcile.Result, error) {
 	reqLogger := log.WithValues("Request.Namespace", request.Namespace, "Request.Name", request.Name)
 
-	if err := r.status.CheckExistingAgentPods(&firstBoot, r.sharedInfo); err != nil {
-		return reconcile.Result{Requeue: true}, err
+	result, err := r.status.CheckExistingAgentPods(&firstBoot, r.sharedInfo)
+	emptyResult := reconcile.Result{}
+	if result != emptyResult || err != nil {
+		return result, err
 	}
 
 	if !r.isForNcpDeployOrNodeAgentDS(request) {
 		// the request is not for ncp deployement or nsx-node-agent ds, but for nsx-node-agent pod
 		if r.isForNsxNodeAgentPod(request) {
 			reqLogger.Info("Reconciling pod update for network status")
-			r.status.SetNodeConditionFromPod(request.NamespacedName, r.sharedInfo, nil)
+			return r.status.SetNodeConditionFromPod(request.NamespacedName, r.sharedInfo, nil)
 		}
 		return reconcile.Result{}, nil
 	}
@@ -217,55 +212,42 @@ func (r *ReconcilePod) Reconcile(request reconcile.Request) (reconcile.Result, e
 		}
 	}
 
-	return reconcile.Result{RequeueAfter: ResyncPeriod}, nil
+	return reconcile.Result{RequeueAfter: operatortypes.DefaultResyncPeriod}, nil
 }
 
 func (r *ReconcilePod) recreateNsxNcpResourceIfDeleted(resName string) error {
-	instance := identifyAndGetInstance(resName)
-	instanceDetails := types.NamespacedName{
-		Namespace: operatortypes.NsxNamespace,
-		Name:      resName,
-	}
-
-	doesResExist, err := r.checkIfK8sResourceExists(instance, instanceDetails)
+	doesResExist, err := operatortypes.CheckIfNCPK8sResourceExists(
+		r.client, resName)
 	if err != nil {
 		log.Error(err, fmt.Sprintf(
-			"Could not retrieve K8s resource - '%s'", instanceDetails.Name))
+			"An error occurred while retrieving K8s resource - '%s'", resName))
 		return err
 	}
 	if doesResExist {
-		log.Info(fmt.Sprintf(
-			"K8s resource - '%s' already exists", instanceDetails.Name))
+		log.V(1).Info(fmt.Sprintf(
+			"K8s resource - '%s' already exists", resName))
 		return nil
 	}
 
-	log.Info(fmt.Sprintf("K8s resource - '%s' does not exist. It will be recreated", instanceDetails.Name))
+	log.Info(fmt.Sprintf("K8s resource - '%s' does not exist. It will be recreated", resName))
 
 	k8sObj := r.identifyAndGetK8SObjToCreate(resName)
 	if k8sObj == nil {
 		log.Info(fmt.Sprintf("%s spec not set. Waiting for config_map controller to set it", resName))
 	}
 	if err = r.setControllerReference(r, k8sObj); err != nil {
-		log.Info(fmt.Sprintf(
-			"Failed to set controller reference for K8s resource: %s", instanceDetails.Name))
+		log.Error(err, fmt.Sprintf(
+			"Failed to set controller reference for K8s resource: %s", resName))
 		return err
 	}
 	if err = r.createK8sObject(k8sObj); err != nil {
 		log.Info(fmt.Sprintf(
-			"Failed to recreate K8s resource: %s", instanceDetails.Name))
+			"Failed to recreate K8s resource: %s", resName))
 		return err
 	}
-	log.Info(fmt.Sprintf("Recreated K8s resource: %s", instanceDetails.Name))
+	log.Info(fmt.Sprintf("Recreated K8s resource: %s", resName))
 
 	return nil
-}
-
-func identifyAndGetInstance(resName string) runtime.Object {
-	if resName == operatortypes.NsxNcpBootstrapDsName || resName == operatortypes.NsxNodeAgentDsName {
-		return &appsv1.DaemonSet{}
-	} else {
-		return &appsv1.Deployment{}
-	}
 }
 
 func (r *ReconcilePod) identifyAndGetK8SObjToCreate(resName string) *unstructured.Unstructured {
@@ -276,19 +258,6 @@ func (r *ReconcilePod) identifyAndGetK8SObjToCreate(resName string) *unstructure
 	} else {
 		return r.sharedInfo.NsxNcpDeploymentSpec.DeepCopy()
 	}
-}
-
-func (r *ReconcilePod) checkIfK8sResourceExists(
-	instance runtime.Object,
-	instanceDetails types.NamespacedName) (bool, error) {
-	err := r.client.Get(context.TODO(), instanceDetails, instance)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return false, nil
-		}
-		return false, err
-	}
-	return true, nil
 }
 
 func (adaptor *PodK8s) setControllerReference(r *ReconcilePod, obj *unstructured.Unstructured) error {
@@ -325,7 +294,8 @@ func (r *ReconcilePod) createK8sObject(obj *unstructured.Unstructured) error {
 }
 
 func (r *ReconcilePod) recreateNodeAgentPodsIfInvalidResolvConf(
-	resName string) error {
+	resName string,
+) error {
 	podsInCLB, err := identifyPodsInCLBDueToInvalidResolvConf(r.client)
 	if err != nil {
 		log.Error(err, "Could not identify if any pod is in CLB because "+
@@ -342,13 +312,15 @@ func (r *ReconcilePod) recreateNodeAgentPodsIfInvalidResolvConf(
 }
 
 func identifyPodsInCLBDueToInvalidResolvConf(c client.Client) (
-	[]corev1.Pod, error) {
+	[]corev1.Pod, error,
+) {
 	var podsInCLB []corev1.Pod
 	podList := &corev1.PodList{}
 	nodeAgentLabelSelector := labels.SelectorFromSet(
 		map[string]string{"component": operatortypes.NsxNodeAgentDsName})
 	err := c.List(context.TODO(), podList, &client.ListOptions{
-		LabelSelector: nodeAgentLabelSelector})
+		LabelSelector: nodeAgentLabelSelector,
+	})
 	if err != nil {
 		log.Error(err, "Error while getting the post list for node-agent")
 		return nil, err
@@ -365,8 +337,8 @@ func identifyPodsInCLBDueToInvalidResolvConf(c client.Client) (
 				nodeAgentLogs, "Failed to establish a new connection: "+
 					"[Errno -2] Name or service not known") {
 				log.Info(fmt.Sprintf(
-					"Pod %v is in CLB because of invalid resolv.conf. "+
-						"It shall be restarted", pod.Name))
+					"Pod %v in node %v is in CLB because of invalid resolv.conf. "+
+						"It shall be restarted", pod.Name, pod.Spec.NodeName))
 				podsInCLB = append(podsInCLB, pod)
 			}
 		}
@@ -387,7 +359,8 @@ func isNodeAgentContainerInCLB(pod *corev1.Pod) bool {
 }
 
 var getContainerLogsInPod = func(pod *corev1.Pod, containerName string) (
-	string, error) {
+	string, error,
+) {
 	config, err := rest.InClusterConfig()
 	if err != nil {
 		log.Error(err, "Failed to invoke rest.InClusterConfig")
@@ -402,7 +375,8 @@ var getContainerLogsInPod = func(pod *corev1.Pod, containerName string) (
 	podLogOptions := &corev1.PodLogOptions{
 		Container: operatortypes.NsxNodeAgentContainerName,
 		Previous:  true,
-		TailLines: &logLinesRetrieved}
+		TailLines: &logLinesRetrieved,
+	}
 	podLogs, err := clientSet.CoreV1().Pods(pod.Namespace).GetLogs(
 		pod.Name, podLogOptions).Stream()
 	if err != nil {
@@ -424,7 +398,7 @@ func deletePods(pods []corev1.Pod, c client.Client) bool {
 	allPodsDeleted := true
 	for _, pod := range pods {
 		err := c.Delete(
-			context.TODO(), &pod, client.GracePeriodSeconds(5),
+			context.TODO(), &pod, client.GracePeriodSeconds(60),
 			client.PropagationPolicy(policy))
 		if err != nil {
 			log.Error(err, fmt.Sprintf("Unable to delete pod %v. Its "+

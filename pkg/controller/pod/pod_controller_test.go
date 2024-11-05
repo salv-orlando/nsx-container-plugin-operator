@@ -174,8 +174,8 @@ func (r *ReconcilePod) testReconcileOnWatchedResource(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reconcile: (%v)", err)
 	}
-	if res.RequeueAfter != ResyncPeriod {
-		t.Fatalf("reconcile should requeue the request after %v", ResyncPeriod)
+	if res.RequeueAfter != operatortypes.DefaultResyncPeriod {
+		t.Fatalf("reconcile should requeue the request after %v", operatortypes.DefaultResyncPeriod)
 	}
 	r.client.Delete(context.TODO(), ncpDeployment)
 }
@@ -213,8 +213,8 @@ func (r *ReconcilePod) testReconcileOnWatchedResourceWhenDeleted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reconcile: (%v)", err)
 	}
-	if res.RequeueAfter != ResyncPeriod {
-		t.Fatalf("reconcile should requeue the request after %v", ResyncPeriod)
+	if res.RequeueAfter != operatortypes.DefaultResyncPeriod {
+		t.Fatalf("reconcile should requeue the request after %v", operatortypes.DefaultResyncPeriod)
 	}
 
 	// Validate that reconcile recreated the deployment
@@ -289,9 +289,9 @@ func (r *ReconcilePod) testReconcileOnCLBNsxNodeAgentInvalidResolvConf(
 	if err != nil {
 		t.Fatalf("reconcile: (%v)", err)
 	}
-	if res.RequeueAfter != ResyncPeriod {
+	if res.RequeueAfter != operatortypes.DefaultResyncPeriod {
 		t.Fatalf("reconcile should requeue the request after %v but it did "+
-			"after %v", ResyncPeriod, res.RequeueAfter)
+			"after %v", operatortypes.DefaultResyncPeriod, res.RequeueAfter)
 	}
 	obj := &corev1.Pod{}
 	namespacedName := types.NamespacedName{
@@ -336,9 +336,9 @@ func (r *ReconcilePod) testReconcileOnCLBNsxNodeAgentInvalidResolvConf(
 	if err != nil {
 		t.Fatalf("reconcile: (%v)", err)
 	}
-	if res.RequeueAfter != ResyncPeriod {
+	if res.RequeueAfter != operatortypes.DefaultResyncPeriod {
 		t.Fatalf("reconcile should requeue the request after %v but it did "+
-			"after %v", ResyncPeriod, res.RequeueAfter)
+			"after %v", operatortypes.DefaultResyncPeriod, res.RequeueAfter)
 	}
 	obj = &corev1.Pod{}
 	err = c.Get(context.TODO(), namespacedName, obj)
@@ -354,18 +354,6 @@ func TestPodControllerReconcile(t *testing.T) {
 	r.testReconcileOnWatchedResource(t)
 	r.testReconcileOnWatchedResourceWhenDeleted(t)
 	r.testReconcileOnCLBNsxNodeAgentInvalidResolvConf(t)
-}
-
-func TestPodController_identifyAndGetInstance(t *testing.T) {
-	if !reflect.DeepEqual(identifyAndGetInstance(operatortypes.NsxNcpDeploymentName), &appsv1.Deployment{}) {
-		t.Fatalf("nsx-ncp instance must be a Deployment")
-	}
-	if !reflect.DeepEqual(identifyAndGetInstance(operatortypes.NsxNcpBootstrapDsName), &appsv1.DaemonSet{}) {
-		t.Fatalf("nsx-ncp instance must be a DaemonSet")
-	}
-	if !reflect.DeepEqual(identifyAndGetInstance(operatortypes.NsxNodeAgentDsName), &appsv1.DaemonSet{}) {
-		t.Fatalf("nsx-ncp instance must be a DaemonSet")
-	}
 }
 
 func TestPodController_deletePods(t *testing.T) {

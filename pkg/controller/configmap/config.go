@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"net"
@@ -28,6 +29,20 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
+var immutableFields = []struct {
+	Section string
+	Key     string
+}{
+	{
+		Section: "coe",
+		Key:     "cluster",
+	},
+	{
+		Section: "nsx_v3",
+		Key:     "l4_lb_auto_scaling",
+	},
+}
+
 type Adaptor interface {
 	FillDefaults(configmap *corev1.ConfigMap, spec *configv1.NetworkSpec) error
 	validateConfigMap(configmap *corev1.ConfigMap) []error
@@ -37,7 +52,7 @@ type Adaptor interface {
 	getNetworkConfig(r *ReconcileConfigMap) (*configv1.Network, error)
 }
 
-type ConfigMap struct {}
+type ConfigMap struct{}
 
 type ConfigMapK8s struct {
 	ConfigMap
@@ -55,6 +70,12 @@ func (adaptor *ConfigMapK8s) FillDefaults(configmap *corev1.ConfigMap, spec *con
 		log.Error(err, "failed to load ConfigMap")
 		return err
 	}
+
+	if cfg.Section("coe").HasKey("adaptor") && cfg.Section("coe").Key("adaptor").Value() != "kubernetes" {
+		log.Info("The operator infers the adaptor to use from the environment. Any setting for coe.adaptor will be ignored")
+	}
+	appendErrorIfNotNil(&errs, fillDefault(cfg, "coe", "adaptor", "kubernetes", true))
+	appendErrorIfNotNil(&errs, fillDefault(cfg, "nsx_v3", "policy_nsxapi", "True", true))
 	appendErrorIfNotNil(&errs, fillDefault(cfg, "coe", "enable_snat", "True", false))
 	appendErrorIfNotNil(&errs, fillDefault(cfg, "ha", "enable", "True", false))
 	appendErrorIfNotNil(&errs, fillDefault(cfg, "nsx_node_agent", "mtu", strconv.Itoa(operatortypes.DefaultMTU), false))
@@ -77,16 +98,21 @@ func (adaptor *ConfigMapOc) FillDefaults(configmap *corev1.ConfigMap, spec *conf
 		return err
 	}
 	// We support only policy API, single tier topo on openshift4
+	if cfg.Section("coe").HasKey("adaptor") && cfg.Section("coe").Key("adaptor").Value() != "openshift4" {
+		log.Info("The operator infers the adaptor to use from the environment. Any setting for coe.adaptor will be ignored")
+	}
 	appendErrorIfNotNil(&errs, fillDefault(cfg, "coe", "adaptor", "openshift4", true))
 	appendErrorIfNotNil(&errs, fillDefault(cfg, "nsx_v3", "policy_nsxapi", "True", true))
 	appendErrorIfNotNil(&errs, fillDefault(cfg, "nsx_v3", "single_tier_topology", "True", true))
-	appendErrorIfNotNil(&errs, fillDefault(cfg, "nsx_v3", "wait_for_security_policy_sync", "True", false))
 	appendErrorIfNotNil(&errs, fillDefault(cfg, "coe", "enable_snat", "True", false))
 	appendErrorIfNotNil(&errs, fillDefault(cfg, "ha", "enable", "True", false))
-	appendErrorIfNotNil(&errs, fillDefault(cfg, "k8s", "process_oc_network", "False", true))
+
 	// For Openshift add a 3-seconds agent delay by default
 	appendErrorIfNotNil(&errs, fillDefault(cfg, "nsx_node_agent", "waiting_before_cni_response", "3", false))
 	appendErrorIfNotNil(&errs, fillDefault(cfg, "nsx_node_agent", "mtu", strconv.Itoa(operatortypes.DefaultMTU), false))
+	// For Openshift force enable_ovs_mcast_snooping as False by default for IPI and UPI installation
+        // keepalived is configured with unicast by default from OC 4.11
+	appendErrorIfNotNil(&errs, fillDefault(cfg, "nsx_node_agent", "enable_ovs_mcast_snooping", "false", false))
 	appendErrorIfNotNil(&errs, fillClusterNetwork(spec, cfg))
 
 	// Write config back to ConfigMap data
@@ -101,13 +127,12 @@ func (adaptor *ConfigMapOc) FillDefaults(configmap *corev1.ConfigMap, spec *conf
 
 func (adaptor *ConfigMapK8s) validateConfigMap(configmap *corev1.ConfigMap) []error {
 	errs := []error{}
-	data := configmap.Data
-	cfg, err := ini.Load([]byte(data[operatortypes.ConfigMapDataKey]))
+	data := &configmap.Data
+	cfg, err := ini.Load([]byte((*data)[operatortypes.ConfigMapDataKey]))
 	if err != nil {
 		errs = append(errs, errors.Wrapf(err, "failed to load ConfigMap"))
 		return errs
 	}
-	appendErrorIfNotNil(&errs, validateConfig(cfg, "coe", "adaptor"))
 	appendErrorIfNotNil(&errs, validateConfig(cfg, "coe", "cluster"))
 	appendErrorIfNotNil(&errs, validateConfig(cfg, "nsx_v3", "nsx_api_managers"))
 	if cfg.Section("coe").Key("enable_snat").Value() == "True" {
@@ -119,12 +144,10 @@ func (adaptor *ConfigMapK8s) validateConfigMap(configmap *corev1.ConfigMap) []er
 		validateConfig(cfg, "nsx_v3", "top_tier_router") != nil {
 		appendErrorIfNotNil(&errs, errors.Errorf("failed to get tier0_gateway or top_tier_router"))
 	}
-	// Check MTU value
-	mtu := cfg.Section("nsx_node_agent").Key("mtu").Value()
-	_, err = strconv.Atoi(mtu)
-	if err != nil {
-		appendErrorIfNotNil(&errs, errors.Wrapf(err, "mtu is invalid"))
-	}
+
+	errs = append(errs, validateNodeAgentOptions(configmap)...)
+	errs = append(errs, validateCommonOptions(configmap)...)
+	errs = append(errs, validateUnSupportedOptions(configmap)...)
 
 	return errs
 }
@@ -132,8 +155,8 @@ func (adaptor *ConfigMapK8s) validateConfigMap(configmap *corev1.ConfigMap) []er
 func (adaptor *ConfigMapOc) validateConfigMap(configmap *corev1.ConfigMap) []error {
 	// TODO: merge validateConfigMap because most logic are the same
 	errs := []error{}
-	data := configmap.Data
-	cfg, err := ini.Load([]byte(data[operatortypes.ConfigMapDataKey]))
+	data := &configmap.Data
+	cfg, err := ini.Load([]byte((*data)[operatortypes.ConfigMapDataKey]))
 	if err != nil {
 		errs = append(errs, errors.Wrapf(err, "failed to load ConfigMap"))
 		return errs
@@ -148,12 +171,10 @@ func (adaptor *ConfigMapOc) validateConfigMap(configmap *corev1.ConfigMap) []err
 		validateConfig(cfg, "nsx_v3", "top_tier_router") != nil {
 		appendErrorIfNotNil(&errs, errors.Errorf("failed to get tier0_gateway or top_tier_router"))
 	}
-	// Check MTU value
-	mtu := cfg.Section("nsx_node_agent").Key("mtu").Value()
-	_, err = strconv.Atoi(mtu)
-	if err != nil {
-		appendErrorIfNotNil(&errs, errors.Wrapf(err, "mtu is invalid"))
-	}
+
+	errs = append(errs, validateNodeAgentOptions(configmap)...)
+	errs = append(errs, validateCommonOptions(configmap)...)
+	errs = append(errs, validateUnSupportedOptions(configmap)...)
 
 	return errs
 }
@@ -278,6 +299,76 @@ func validateConfig(cfg *ini.File, sec string, key string) error {
 	return nil
 }
 
+// Validate node agent specific options
+func validateNodeAgentOptions(configmap *corev1.ConfigMap) []error {
+	errs := []error{}
+	data := &configmap.Data
+	cfg, err := ini.Load([]byte((*data)[operatortypes.ConfigMapDataKey]))
+
+	// Check MTU value
+	mtu := cfg.Section("nsx_node_agent").Key("mtu").Value()
+	_, err = strconv.Atoi(mtu)
+	if err != nil {
+		appendErrorIfNotNil(&errs, errors.Wrapf(err, "mtu is invalid"))
+	}
+	return errs
+}
+
+// Validate common options for both ncp and node agent
+func validateCommonOptions(configmap *corev1.ConfigMap) []error {
+	errs := []error{}
+	data := &configmap.Data
+	cfg, _ := ini.Load([]byte((*data)[operatortypes.ConfigMapDataKey]))
+	// Check DEFAULT section log_file option
+	if cfg.Section("DEFAULT").Key("log_file").Value() != "" {
+		appendErrorIfNotNil(&errs, errors.Errorf("DEFAULT section option: log_file is not allowed to change, current value:%s",
+			cfg.Section("DEFAULT").Key("log_file").Value()))
+	}
+	return errs
+}
+
+// Validate non supported options
+// Including WCP and TAS specific options, MP supported options
+func validateUnSupportedOptions(configmap *corev1.ConfigMap) []error {
+	errs := []error{}
+	data := &configmap.Data
+	is_changed := false
+	cfg, err := ini.Load([]byte((*data)[operatortypes.ConfigMapDataKey]))
+
+	for section, keys := range operatortypes.MPOptions {
+		for _, key := range keys {
+			if optionInConfigMap(configmap, section, key) {
+				log.Info(fmt.Sprintf("%s section option: %s is not supported in PolicyAPI, ignored this config option", section, key))
+				cfg.Section(section).DeleteKey(key)
+				is_changed = true
+			}
+		}
+	}
+
+	for section, keys := range operatortypes.WCPOptions {
+		for _, key := range keys {
+			if optionInConfigMap(configmap, section, key) {
+				log.Info(fmt.Sprintf("%s section option: %s is not supported in Operator, ignored this config option", section, key))
+				cfg.Section(section).DeleteKey(key)
+				is_changed = true
+			}
+		}
+	}
+
+	if len(cfg.Section(operatortypes.TASSection).Keys()) != 0 {
+		log.Info(fmt.Sprintf("%s section options are not supported in Operator, ignored this section", operatortypes.TASSection))
+		cfg.DeleteSection(operatortypes.TASSection)
+		is_changed = true
+	}
+
+	if is_changed {
+		// Write config back to ConfigMap data
+		(*data)[operatortypes.ConfigMapDataKey], err = iniWriteToString(cfg)
+		appendErrorIfNotNil(&errs, err)
+	}
+	return errs
+}
+
 func getPrefixFromCIDR(cidr string) (uint32, error) {
 	cidrPrefix := cidr[strings.LastIndex(cidr, "/")+1:]
 	i, err := strconv.ParseUint(cidrPrefix, 10, 32)
@@ -287,8 +378,10 @@ func getPrefixFromCIDR(cidr string) (uint32, error) {
 	return uint32(i), nil
 }
 
-func Render(configmap *corev1.ConfigMap, ncpReplicas *int32, nsxSecret *corev1.Secret,
-	lbSecret *corev1.Secret) ([]*unstructured.Unstructured, error) {
+func Render(configmap *corev1.ConfigMap, ncpReplicas *int32, ncpNodeSelector *map[string]string,
+	ncpTolerations *[]corev1.Toleration, nsxNodeAgentDsTolerations *[]corev1.Toleration,
+	nsxSecret *corev1.Secret, lbSecret *corev1.Secret,
+) ([]*unstructured.Unstructured, error) {
 	log.Info("Starting render phase")
 	objs := []*unstructured.Unstructured{}
 
@@ -323,15 +416,48 @@ func Render(configmap *corev1.ConfigMap, ncpReplicas *int32, nsxSecret *corev1.S
 			return nil, errors.Wrap(err, "failed to get ha option")
 		}
 	}
-	if haEnabled {
-		renderData.Data[operatortypes.NcpReplicasKey] = *ncpReplicas
-	} else {
-		renderData.Data[operatortypes.NcpReplicasKey] = int32(1)
-		if *ncpReplicas != 1 {
-			*ncpReplicas = 1
-			log.Info(fmt.Sprintf("Set nsx-ncp deployment replicas to 1 instead of %d as HA is disabled",
-				*ncpReplicas))
+
+	if !haEnabled && *ncpReplicas != 1 {
+		log.Info(fmt.Sprintf("Set nsx-ncp deployment replicas to 1 instead of %d as HA is deactivated",
+			*ncpReplicas))
+		*ncpReplicas = 1
+	}
+	renderData.Data[operatortypes.NcpReplicasKey] = *ncpReplicas
+
+	// Set NCP NodeSelector
+	if ncpNodeSelector != nil {
+		jsonStr, err := json.Marshal(ncpNodeSelector)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to get NCP NodeSelector")
 		}
+		// Convert ncpNodeSelector to string
+		renderData.Data[operatortypes.NcpNodeSelectorRenderKey] = string(jsonStr)
+	} else {
+		renderData.Data[operatortypes.NcpNodeSelectorRenderKey] = ""
+	}
+
+	// Set NCP Tolerations
+	if ncpTolerations != nil {
+		jsonStr, err := json.Marshal(ncpTolerations)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to get NCP Tolerations")
+		}
+		// Convert ncpTolerations to string
+		renderData.Data[operatortypes.NcpTolerationsRenderKey] = string(jsonStr)
+	} else {
+		renderData.Data[operatortypes.NcpTolerationsRenderKey] = ""
+	}
+
+	// Set Nsx Node Agent Ds Tolerations
+	if nsxNodeAgentDsTolerations != nil {
+		jsonStr, err := json.Marshal(nsxNodeAgentDsTolerations)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to get Nsx Node Agent Tolerations")
+		}
+		// Convert nsxNodeAgentDsTolerations to string
+		renderData.Data[operatortypes.NsxNodeTolerationsRenderKey] = string(jsonStr)
+	} else {
+		renderData.Data[operatortypes.NsxNodeTolerationsRenderKey] = ""
 	}
 
 	// Set LB secret
@@ -346,11 +472,22 @@ func Render(configmap *corev1.ConfigMap, ncpReplicas *int32, nsxSecret *corev1.S
 	if nsxSecret != nil {
 		renderData.Data[operatortypes.NsxCertRenderKey] = base64.StdEncoding.EncodeToString(nsxSecret.Data["tls.crt"])
 		renderData.Data[operatortypes.NsxKeyRenderKey] = base64.StdEncoding.EncodeToString(nsxSecret.Data["tls.key"])
-		renderData.Data[operatortypes.NsxCARenderKey] = base64.StdEncoding.EncodeToString(nsxSecret.Data["tls.ca"])
+		// Render tls.ca only if specified
+		if tls_ca, found := nsxSecret.Data["tls.ca"]; found {
+			renderData.Data[operatortypes.NsxCARenderKey] = base64.StdEncoding.EncodeToString(tls_ca)
+		} else {
+			renderData.Data[operatortypes.NsxCARenderKey] = ""
+		}
 	} else {
 		renderData.Data[operatortypes.NsxCertRenderKey] = ""
 		renderData.Data[operatortypes.NsxKeyRenderKey] = ""
 		renderData.Data[operatortypes.NsxCARenderKey] = ""
+	}
+	// Set value of use_nsx_ovs_kernel_module
+	if cfg.Section("nsx_node_agent").Key("use_nsx_ovs_kernel_module").Value() == "True" {
+		renderData.Data[operatortypes.NsxOvsKmodRenderKey] = true
+	} else {
+		renderData.Data[operatortypes.NsxOvsKmodRenderKey] = false
 	}
 	manifestDir, err := GetManifestDir()
 	if err != nil {
@@ -379,7 +516,7 @@ func GetManifestDir() (string, error) {
 		return "./manifest/openshift4/coreos", nil
 	} else if strings.Contains(osRelease, "Ubuntu") {
 		return "./manifest/kubernetes/ubuntu", nil
-	} else if (strings.Contains(osRelease, "CentOS") || strings.Contains(osRelease, "Red Hat")) {
+	} else if strings.Contains(osRelease, "CentOS") || strings.Contains(osRelease, "Red Hat") {
 		return "./manifest/kubernetes/rhel", nil
 	}
 	return "", errors.Wrap(err, "failed to get os-release")
@@ -392,10 +529,12 @@ type podNeedChange struct {
 }
 
 func NeedApplyChange(currConfig *corev1.ConfigMap, prevConfig *corev1.ConfigMap) (
-	podNeedChange, error) {
+	podNeedChange, error,
+) {
 	if prevConfig == nil {
 		return podNeedChange{true, true, true}, nil
 	}
+
 	currData := currConfig.Data
 	prevData := prevConfig.Data
 	// Compare the whole data
@@ -414,25 +553,69 @@ func NeedApplyChange(currConfig *corev1.ConfigMap, prevConfig *corev1.ConfigMap)
 		log.Error(err, "Failed to load previous ConfigMap")
 		return podNeedChange{false, false, false}, err
 	}
+
+	// Check whether immutable fields are changed. This check should return an error to
+	// make sure that reconcile could be terminated.
+	if immutableFieldChanged(currCfg, prevCfg) {
+		return podNeedChange{}, errors.New("Immutable field can't be changed.")
+	}
+
 	diffSecs := []string{}
 	currSecs := currCfg.SectionStrings()
 	for _, name := range currSecs {
-		_, err = prevCfg.GetSection(name)
-		if err != nil {
+		if !hasSection(prevCfg, name) {
 			if len(currCfg.Section(name).KeyStrings()) != 0 {
+				log.Info(fmt.Sprintf("Section [%s] is added into configmap", name))
 				diffSecs = append(diffSecs, name)
 			}
 			continue
 		}
 		if !reflect.DeepEqual(currCfg.Section(name).KeysHash(), prevCfg.Section(name).KeysHash()) {
+			// Check which configmap option value is changed
+			keys := currCfg.Section(name).KeyStrings()
+			for _, key := range keys {
+				curKeyValue := currCfg.Section(name).Key(key).Value()
+				// Need to hide value for user-sensitive information option
+				keySensitive := false
+				if name == "nsx_v3" && (key == "lb_default_cert_path" || key == "lb_priv_key_path" ||
+					key == "nsx_api_cert_file" || key == "nsx_api_private_key_file" || key == "nsx_api_password") {
+					keySensitive = true
+				}
+				if prevCfg.Section(name).HasKey(key) {
+					preKeyValue := prevCfg.Section(name).Key(key).Value()
+					if !reflect.DeepEqual(preKeyValue, curKeyValue) {
+						if keySensitive {
+							log.Info(fmt.Sprintf("Section [%s] config option: %s is changed", name, key))
+						} else {
+							log.Info(fmt.Sprintf("Section [%s] config option: %s = %s is changed to %s = %s",
+								name, key, preKeyValue, key, curKeyValue))
+						}
+					}
+				} else {
+					if keySensitive {
+						log.Info(fmt.Sprintf("Section [%s] add/uncomment a new config option: %s",
+							name, key))
+					} else {
+						log.Info(fmt.Sprintf("Section [%s] add/uncomment a new config option: %s = %s",
+							name, key, curKeyValue))
+					}
+				}
+			}
+			keys = prevCfg.Section(name).KeyStrings()
+			for _, key := range keys {
+				if !currCfg.Section(name).HasKey(key) {
+					log.Info(fmt.Sprintf("Section [%s] remove/comment a config option: %s", name, key))
+				}
+			}
+
 			diffSecs = append(diffSecs, name)
 		}
 	}
 	prevSecs := prevCfg.SectionStrings()
 	for _, name := range prevSecs {
-		_, err = currCfg.GetSection(name)
-		if err != nil {
+		if !hasSection(currCfg, name) {
 			if len(prevCfg.Section(name).KeyStrings()) != 0 {
+				log.Info(fmt.Sprintf("Section [%s] is removed from configmap", name))
 				diffSecs = append(diffSecs, name)
 			}
 		}
@@ -443,17 +626,14 @@ func NeedApplyChange(currConfig *corev1.ConfigMap, prevConfig *corev1.ConfigMap)
 		if !needChange.ncp && inSlice(sec, operatortypes.NcpSections) {
 			needChange.ncp = true
 		}
-		if !needChange.agent && inSlice(sec, operatortypes.AgentSections) {
+		if !needChange.agent && inSlice(sec, operatortypes.AgentRestartSections) {
 			needChange.agent = true
 		}
-		bootstrapOpts, found := operatortypes.BootstrapOptions[sec]
-		if !needChange.bootstrap && found {
-			for _, opt := range bootstrapOpts {
-				if currCfg.Section(sec).Key(opt).Value() != prevCfg.Section(sec).Key(opt).Value() {
-					needChange.bootstrap = true
-					break
-				}
-			}
+		if !needChange.agent && checkOptionsChange(operatortypes.AgentRestartOptionKeys, sec, prevCfg, currCfg) {
+			needChange.agent = true
+		}
+		if !needChange.bootstrap && checkOptionsChange(operatortypes.BootstrapRestartOptionKeys, sec, prevCfg, currCfg) {
+			needChange.bootstrap = true
 		}
 		if needChange.ncp && needChange.agent && needChange.bootstrap {
 			break
@@ -465,6 +645,36 @@ func NeedApplyChange(currConfig *corev1.ConfigMap, prevConfig *corev1.ConfigMap)
 	}
 
 	return needChange, nil
+}
+
+func checkOptionsChange(options map[string][]string, sec string, prevCfg, currCfg *ini.File) bool {
+	if _, ok := options[sec]; !ok {
+		return false
+	}
+	if hasSection(prevCfg, sec) != hasSection(currCfg, sec) {
+		return true
+	}
+	// We can assert that section `sec` exists in both prevCfg and currCfg here.
+	for _, key := range options[sec] {
+		if prevCfg.Section(sec).HasKey(key) != currCfg.Section(sec).HasKey(key) {
+			return true
+		}
+		if prevCfg.Section(sec).HasKey(key) && currCfg.Section(sec).HasKey(key) &&
+			prevCfg.Section(sec).Key(key).Value() != currCfg.Section(sec).Key(key).Value() {
+			return true
+		}
+	}
+	return false
+}
+
+func immutableFieldChanged(cur, prev *ini.File) bool {
+	for _, field := range immutableFields {
+		if cur.Section(field.Section).Key(field.Key).String() != prev.Section(field.Section).Key(field.Key).String() {
+			log.Info(fmt.Sprintf("Immutable field %s.%s shouldn't be changed, skip applying changes.", field.Section, field.Key))
+			return true
+		}
+	}
+	return false
 }
 
 func inSlice(str string, s []string) bool {
@@ -506,7 +716,8 @@ func generateConfigMap(srcCfg *ini.File, sections []string) (string, error) {
 }
 
 func GenerateOperatorConfigMap(opConfigmap *corev1.ConfigMap, ncpConfigMap *corev1.ConfigMap,
-	agentConfigMap *corev1.ConfigMap) error {
+	agentConfigMap *corev1.ConfigMap,
+) error {
 	ncpCfg, err := ini.Load([]byte(ncpConfigMap.Data[operatortypes.ConfigMapDataKey]))
 	if err != nil {
 		log.Error(err, "Failed to load nsx-ncp ConfigMap")
@@ -540,6 +751,11 @@ func GenerateOperatorConfigMap(opConfigmap *corev1.ConfigMap, ncpConfigMap *core
 		return err
 	}
 	return nil
+}
+
+func hasSection(cfg *ini.File, section string) bool {
+	_, err := cfg.GetSection(section)
+	return err == nil
 }
 
 func iniWriteToString(cfg *ini.File) (string, error) {
@@ -597,4 +813,62 @@ func IsMTUChanged(currConfigMap *corev1.ConfigMap, prevConfigMap *corev1.ConfigM
 	} else {
 		return true
 	}
+}
+
+func FillNsxAuthCfg(configmap *corev1.ConfigMap, nsxSecret *corev1.Secret) error {
+	errs := []error{}
+	data := &configmap.Data
+	cfg, err := ini.Load([]byte((*data)[operatortypes.ConfigMapDataKey]))
+	if err != nil {
+		log.Error(err, "failed to load ConfigMap")
+		return err
+	}
+
+	if nsx_cert, found := nsxSecret.Data["tls.crt"]; found && len(nsx_cert) > 0 {
+		appendErrorIfNotNil(&errs, fillDefault(cfg, "nsx_v3", "nsx_api_cert_file", "/etc/nsx-ujo/nsx-cert/tls.crt", true))
+	}
+
+	if nsx_key, found := nsxSecret.Data["tls.key"]; found && len(nsx_key) > 0 {
+		appendErrorIfNotNil(&errs, fillDefault(cfg, "nsx_v3", "nsx_api_private_key_file", "/etc/nsx-ujo/nsx-cert/tls.key", true))
+	}
+
+	if ca_file, found := nsxSecret.Data["tls.ca"]; found && len(ca_file) > 0 {
+		appendErrorIfNotNil(&errs, fillDefault(cfg, "nsx_v3", "ca_file", "/etc/nsx-ujo/nsx-cert/tls.ca", true))
+	}
+
+	// Write config back to ConfigMap data
+	(*data)[operatortypes.ConfigMapDataKey], err = iniWriteToString(cfg)
+	appendErrorIfNotNil(&errs, err)
+
+	if len(errs) > 0 {
+		return errors.Errorf("failed to fill nsx authentication configuration: %q", errs)
+	}
+	return nil
+}
+
+func FillLbCertCfg(configmap *corev1.ConfigMap, lbSecret *corev1.Secret) error {
+	errs := []error{}
+	data := &configmap.Data
+	cfg, err := ini.Load([]byte((*data)[operatortypes.ConfigMapDataKey]))
+	if err != nil {
+		log.Error(err, "failed to load ConfigMap")
+		return err
+	}
+
+	if lb_cert, found := lbSecret.Data["tls.crt"]; found && len(lb_cert) > 0 {
+		appendErrorIfNotNil(&errs, fillDefault(cfg, "nsx_v3", "lb_default_cert_path", "/etc/nsx-ujo/lb-cert/tls.crt", true))
+	}
+
+	if lb_key, found := lbSecret.Data["tls.key"]; found && len(lb_key) > 0 {
+		appendErrorIfNotNil(&errs, fillDefault(cfg, "nsx_v3", "lb_priv_key_path", "/etc/nsx-ujo/lb-cert/tls.key", true))
+	}
+
+	// Write config back to ConfigMap data
+	(*data)[operatortypes.ConfigMapDataKey], err = iniWriteToString(cfg)
+	appendErrorIfNotNil(&errs, err)
+
+	if len(errs) > 0 {
+		return errors.Errorf("failed to fill lb certification configuration: %q", errs)
+	}
+	return nil
 }

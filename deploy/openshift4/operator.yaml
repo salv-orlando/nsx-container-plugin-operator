@@ -3,6 +3,8 @@ kind: Deployment
 metadata:
   name: nsx-ncp-operator
   namespace: nsx-system-operator
+  labels:
+    tier: nsx-networking
 spec:
   replicas: 1
   selector:
@@ -12,12 +14,15 @@ spec:
     metadata:
       labels:
         name: nsx-ncp-operator
+        tier: nsx-networking
     spec:
       hostNetwork: true
       serviceAccountName: nsx-ncp-operator
       tolerations:
       - effect: NoSchedule
         key: node-role.kubernetes.io/master
+      - effect: NoSchedule
+        key: node-role.kubernetes.io/control-plane
       - effect: NoSchedule
         key: node.kubernetes.io/not-ready
       - effect: NoSchedule
@@ -27,8 +32,8 @@ spec:
         name: host-os-release
       containers:
         - name: nsx-ncp-operator
-          image: vmware/nsx-container-plugin-operator
-          command: ["/bin/bash", "-c", "nsx-ncp-operator --zap-time-encoding=iso8601"]
+          image: docker.io/vmware/nsx-container-plugin-operator
+          command: ["/bin/bash", "-c", "nsx-ncp-operator --zap-time-encoding=iso8601 --metrics-server-bind-address=:8181"]
           volumeMounts:
           - {mountPath: /host/etc/os-release, name: host-os-release}
           imagePullPolicy: IfNotPresent

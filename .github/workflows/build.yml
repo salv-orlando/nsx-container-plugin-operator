@@ -3,25 +3,26 @@ name: Build image
 on:
   pull_request:
     branches:
-      - master
+      - main
   push:
     branches:
-      - master
+      - main
 
 jobs:
   build-image:
-    runs-on: [ubuntu-18.04]
+    runs-on: [ubuntu-latest]
     steps:
-      - name: Set up Go 1.13
-        uses: actions/setup-go@v1
+      - name: Set up Go 1.21
+        uses: actions/setup-go@v4
         with:
-          go-version: 1.13
+          go-version: 1.21.5
+          cache: false
       - name: Check-out code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
       - name: Build image
         run: make
       - name: Push images to registry
-        if: ${{ github.repository == 'vmware/nsx-container-plugin-operator' && github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+        if: ${{ github.repository == 'vmware/nsx-container-plugin-operator' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         env:
           DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}

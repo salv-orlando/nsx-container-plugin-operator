@@ -558,6 +558,9 @@ func updateNetworkStatus(networkConfig *configv1.Network, configMap *corev1.Conf
 	}
 
 	if data != nil {
+		data.SetManagedFields(nil)
+		data.SetResourceVersion("")
+		data.SetUID("")
 		if err := apply.ApplyObject(context.TODO(), r.client, data); err != nil {
 			log.Error(err, fmt.Sprintf("Could not apply (%s) %s/%s", data.GroupVersionKind(),
 				data.GetNamespace(), data.GetName()))
